@@ -1,51 +1,4 @@
 
-name: RDP
-
-on:
-  workflow_dispatch:
-
-jobs:
-  secure-rdp:
-    runs-on: windows-latest
-    timeout-minutes: 3600
-
-    steps:
-      - name: Configure Core RDP Settings
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          # Enable Remote Desktop
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0 -Force
-
-          # Keep Network Level Authentication enabled
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 1 -Force
-
-          # Remove existing firewall rule only if present
-          $existingRules = Get-NetFirewallRule `
-            -DisplayName "RDP-Tailscale" `
-            -ErrorAction SilentlyContinue
-
-          if ($existingRules) {
-            $existingRules | Remove-NetFirewallRule
-          }
-
-          # Permit RDP from Tailscale IPv4 addresses only
-          New-NetFirewallRule `
-            -DisplayName "RDP-Tailscale" `
-            -Direction Inbound `
-            -Action Allow `
-            -Protocol TCP `
-            -LocalPort 3389 `
-            -RemoteAddress "100.64.0.0/10" `
-            -Profile Any
-
-          Write-Host "RDP settings configured."
-
       - name: Create RDP User from Repository Secrets
         shell: pwsh
         env:
@@ -65,23 +18,50 @@ jobs:
             throw "RDP_PASSWORD repository secret is missing."
           }
 
-          $securePass = ConvertTo-SecureString `
-            $password -AsPlainText -Force
+          # Export the current local security policy
+          $config = Join-Path $env:TEMP "rdp-security.cfg"
+          $db = Join-Path $env:TEMP "rdp-security.sdb"
 
-          $user = Get-LocalUser `
-            -Name $username -ErrorAction SilentlyContinue
+          secedit /export /cfg $config
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not export the local security policy."
+          }
 
-          if ($null -eq $user) {
-            New-LocalUser `
-              -Name $username `
-              -Password $securePass `
-              -Description "RDP User" `
-              -AccountNeverExpires `
-              -PasswordNeverExpires
-          } else {
-            Set-LocalUser `
-              -Name $username `
-              -Password $securePass
+          # Disable local password complexity where permitted
+          $content = Get-Content $config -Raw
+          if ($content -match '(?m)^\s*PasswordComplexity\s*=') {
+            $content = $content -replace '(?m)^\s*PasswordComplexity\s*=\s*\d+', 'PasswordComplexity = 0'
+            Set-Content -Path $config -Value $content -Encoding Unicode
+
+            secedit /configure /db $db /cfg $config /areas SECURITYPOLICY
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "Could not apply the local security policy; checking the password requirements instead."
+            }
+          }
+
+          # Check password length without revealing the password
+          Write-Host "Password length: $($password.Length) characters."
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          $user = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+
+          try {
+            if ($null -eq $user) {
+              New-LocalUser `
+                -Name $username `
+                -Password $securePass `
+                -Description "RDP User" `
+                -AccountNeverExpires `
+                -PasswordNeverExpires `
+                -ErrorAction Stop
+            } else {
+              Set-LocalUser `
+                -Name $username `
+                -Password $securePass `
+                -ErrorAction Stop
+            }
+          } catch {
+            throw "Windows rejected the password. Check the effective minimum password length, complexity, password history, and any domain policy. Original error: $($_.Exception.Message)"
           }
 
           Enable-LocalUser -Name $username
@@ -91,104 +71,4 @@ jobs:
             -Member $username `
             -ErrorAction SilentlyContinue
 
-          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
-            throw "RDP user creation failed."
-          }
-
           Write-Host "RDP user configured successfully."
-
-      - name: Install Tailscale
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-
-          $process = Start-Process msiexec.exe `
-            -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
-            -Wait -PassThru
-
-          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
-
-          if ($process.ExitCode -notin @(0, 3010)) {
-            throw "Tailscale installation failed: exit code $($process.ExitCode)"
-          }
-
-      - name: Establish Tailscale Connection
-        shell: pwsh
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-            throw "TAILSCALE_AUTH_KEY repository secret is missing."
-          }
-
-          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          if (-not (Test-Path $tsExe)) {
-            throw "Tailscale executable not found."
-          }
-
-          & $tsExe up `
-            "--authkey=$env:TAILSCALE_AUTH_KEY" `
-            "--hostname=gh-runner-$env:GITHUB_RUN_ID"
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Tailscale connection failed."
-          }
-
-          $tsIP = $null
-
-          for ($i = 0; $i -lt 12 -and -not $tsIP; $i++) {
-            Start-Sleep -Seconds 5
-            $result = & $tsExe ip -4
-
-            if ($LASTEXITCODE -eq 0 -and $result) {
-              $tsIP = ($result | Select-Object -First 1).Trim()
-            }
-          }
-
-          if (-not $tsIP) {
-            throw "Tailscale IP was not assigned."
-          }
-
-          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-
-      - name: Verify RDP Accessibility
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-
-          $testResult = Test-NetConnection `
-            -ComputerName $env:TAILSCALE_IP `
-            -Port 3389 `
-            -WarningAction SilentlyContinue
-
-          if (-not $testResult.TcpTestSucceeded) {
-            throw "TCP connection to RDP port 3389 failed."
-          }
-
-          Write-Host "TCP connectivity successful."
-
-      - name: Maintain Connection
-        shell: pwsh
-        env:
-          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
-        run: |
-          Write-Host "=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: $env:RDP_USERNAME"
-          Write-Host "Password: Stored securely in GitHub Secrets"
-          Write-Host "=================="
-
-          while ($true) {
-            Write-Host "[$(Get-Date)] RDP session running. Cancel workflow to stop."
-            Start-Sleep -Seconds 300
-          }
