@@ -1,0 +1,74 @@
+
+      - name: Create RDP User from Repository Secrets
+        shell: pwsh
+        env:
+          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $username = $env:RDP_USERNAME
+          $password = $env:RDP_PASSWORD
+
+          if ([string]::IsNullOrWhiteSpace($username)) {
+            throw "RDP_USERNAME repository secret is missing."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($password)) {
+            throw "RDP_PASSWORD repository secret is missing."
+          }
+
+          # Export the current local security policy
+          $config = Join-Path $env:TEMP "rdp-security.cfg"
+          $db = Join-Path $env:TEMP "rdp-security.sdb"
+
+          secedit /export /cfg $config
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not export the local security policy."
+          }
+
+          # Disable local password complexity where permitted
+          $content = Get-Content $config -Raw
+          if ($content -match '(?m)^\s*PasswordComplexity\s*=') {
+            $content = $content -replace '(?m)^\s*PasswordComplexity\s*=\s*\d+', 'PasswordComplexity = 0'
+            Set-Content -Path $config -Value $content -Encoding Unicode
+
+            secedit /configure /db $db /cfg $config /areas SECURITYPOLICY
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "Could not apply the local security policy; checking the password requirements instead."
+            }
+          }
+
+          # Check password length without revealing the password
+          Write-Host "Password length: $($password.Length) characters."
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          $user = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+
+          try {
+            if ($null -eq $user) {
+              New-LocalUser `
+                -Name $username `
+                -Password $securePass `
+                -Description "RDP User" `
+                -AccountNeverExpires `
+                -PasswordNeverExpires `
+                -ErrorAction Stop
+            } else {
+              Set-LocalUser `
+                -Name $username `
+                -Password $securePass `
+                -ErrorAction Stop
+            }
+          } catch {
+            throw "Windows rejected the password. Check the effective minimum password length, complexity, password history, and any domain policy. Original error: $($_.Exception.Message)"
+          }
+
+          Enable-LocalUser -Name $username
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "RDP user configured successfully."
